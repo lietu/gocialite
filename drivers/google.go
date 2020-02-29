@@ -3,7 +3,7 @@ package drivers
 import (
 	"net/http"
 
-	"github.com/danilopolani/gocialite/structs"
+	"github.com/lietu/gocialite/structs"
 	"golang.org/x/oauth2/google"
 )
 

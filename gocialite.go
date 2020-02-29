@@ -11,45 +11,67 @@ import (
 	"strings"
 	"sync"
 
-	"github.com/danilopolani/gocialite/drivers"
-	"github.com/danilopolani/gocialite/structs"
+	"github.com/lietu/gocialite/drivers"
+	"github.com/lietu/gocialite/structs"
 	"golang.org/x/oauth2"
 	"gopkg.in/oleiade/reflections.v1"
 )
 
+type StoreStateHandler func(state string)
+type ValidateStateHandler func(state string) bool
+
 // Dispatcher allows to safely issue concurrent Gocials
 type Dispatcher struct {
-	mu sync.RWMutex
-	g  map[string]*Gocial
+	mu                   sync.RWMutex
+	g                    map[string]bool
+	StoreStateHandler    StoreStateHandler
+	ValidateStateHandler ValidateStateHandler
 }
 
 // NewDispatcher creates new Dispatcher
 func NewDispatcher() *Dispatcher {
-	return &Dispatcher{g: make(map[string]*Gocial)}
+	d := &Dispatcher{g: make(map[string]bool)}
+	d.StoreStateHandler = d.StoreState
+	d.ValidateStateHandler = d.ValidateState
+	return d
+}
+
+// Default state handler, stores states in memory, does not scale to multiple servers
+func (d *Dispatcher) StoreState(state string) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.g[state] = true
+}
+
+// Default state validator, checks in-memory store, does not scale to multiple servers
+func (d *Dispatcher) ValidateState(state string) bool {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	_, ok := d.g[state]
+
+	if ok {
+		delete(d.g, state)
+	}
+
+	return ok
 }
 
 // New Gocial instance
 func (d *Dispatcher) New() *Gocial {
-	d.mu.Lock()
-	defer d.mu.Unlock()
 	state := randToken()
-	g := &Gocial{state: state}
-	d.g[state] = g
-	return g
+	d.StoreStateHandler(state)
+	return &Gocial{state: state}
 }
 
 // Handle callback. Can be called only once for given state.
-func (d *Dispatcher) Handle(state, code string) (*structs.User, *oauth2.Token, error) {
-	d.mu.RLock()
-	g, ok := d.g[state]
-	d.mu.RUnlock()
+func (d *Dispatcher) Handle(driver, state, code string) (*structs.User, *oauth2.Token, error) {
+	ok := d.ValidateStateHandler(state)
 	if !ok {
-		return nil, nil, fmt.Errorf("invalid CSRF token: %s", state)
+		return nil, nil, fmt.Errorf("invalid state token: %s", state)
 	}
+
+	g := &Gocial{state: state, driver: driver}
 	err := g.Handle(state, code)
-	d.mu.Lock()
-	delete(d.g, state)
-	d.mu.Unlock()
 	return &g.User, g.Token, err
 }
 
@@ -92,6 +114,12 @@ func RegisterNewDriver(driver string, defaultscopes []string, callback func(clie
 	defaultScopesMap[driver] = defaultscopes
 }
 
+// Set the state, in distributed scenarios when not using Dispatcher
+func (g *Gocial) State(state string) *Gocial {
+	g.state = state
+	return g
+}
+
 // Driver is needed to choose the correct social
 func (g *Gocial) Driver(driver string) *Gocial {
 	g.driver = driver
@@ -119,13 +147,23 @@ func (g *Gocial) Redirect(clientID, clientSecret, redirectURL string) (string, e
 		return "", fmt.Errorf("Driver not valid: %s", g.driver)
 	}
 
+	err := g.Configure(clientID, clientSecret, redirectURL)
+	if err != nil {
+		return "", err
+	}
+
+	return g.conf.AuthCodeURL(g.state), nil
+}
+
+// Set the OAuth configuration for the selected social oAuth login
+func (g *Gocial) Configure(clientID, clientSecret, redirectURL string) error {
 	// Check if valid redirectURL
 	_, err := url.ParseRequestURI(redirectURL)
 	if err != nil {
-		return "", fmt.Errorf("Redirect URL <%s> not valid: %s", redirectURL, err.Error())
+		return fmt.Errorf("Redirect URL <%s> not valid: %s", redirectURL, err.Error())
 	}
 	if !strings.HasPrefix(redirectURL, "http://") && !strings.HasPrefix(redirectURL, "https://") {
-		return "", fmt.Errorf("Redirect URL <%s> not valid: protocol not valid", redirectURL)
+		return fmt.Errorf("Redirect URL <%s> not valid: protocol not valid", redirectURL)
 	}
 
 	g.conf = &oauth2.Config{
@@ -136,7 +174,7 @@ func (g *Gocial) Redirect(clientID, clientSecret, redirectURL string) (string, e
 		Endpoint:     endpointMap[g.driver],
 	}
 
-	return g.conf.AuthCodeURL(g.state), nil
+	return nil
 }
 
 // Handle callback from provider
@@ -231,7 +269,7 @@ func jsonDecode(js []byte) (map[string]interface{}, error) {
 	if err := decoder.Decode(&decoded); err != nil {
 		return nil, err
 	}
-	
+
 	return decoded, nil
 }
 
